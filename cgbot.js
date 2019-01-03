@@ -5,7 +5,7 @@
 // *****************************
 // Requires
 
-const xmpp = require('simple-xmpp');
+const xmpp = require('simple-xmpp'),
       config = require('./config.json'),
       fs = require('fs'),
       moment = require('moment'),
@@ -17,7 +17,26 @@ const xmpp = require('simple-xmpp');
 // *****************************
 // Globals
 
-let cores = {};
+let cores = {},
+    queueTimer,
+    queue = [];
+
+// *****************************
+// Functions
+
+let kill = () => {
+  console.log('[INFO] Closing process');
+
+  clearInterval(queueTimer);
+
+  config.groupchats.forEach(groupchat => {
+    if (cores.groupchat) {
+      cores[groupchat].kill();
+      cores[groupchat] = undefined;
+    }
+  });
+  process.exit();
+};
 
 // *****************************
 // Main
@@ -25,6 +44,8 @@ let cores = {};
 config.groupchats = config.groupchats.map(groupchat => groupchat.toLowerCase());
 
 xmpp.on('online', data => {
+  console.log('[INFO] Online');
+
   const command = config.core.split(' ');
   config.groupchats.forEach(groupchat => {
     const core = spawn(command[0], _.rest(command));
@@ -32,30 +53,66 @@ xmpp.on('online', data => {
     cores[groupchat] = core;
 
     core.stdout.on('data', data => {
-      let stanza = new Stanza('message', {
-        to: groupchat + '@' + config.conference,
-        type: 'groupchat',
-        id: config.nickname + performance.now()
-      });
+      data = data.toString('utf8').split('\n');
 
-      stanza.c('body').t(data);
+      for (let line of data) {
+        line = line.replace(/[\n\r]/g, '');
 
-      xmpp.conn.send(stanza);
+        if (line) {
+          console.log('[INFO]', groupchat + ':', line);
+
+          if (!line.startsWith('###')) {
+            try {
+              let stanza = new Stanza('message', {
+                to: groupchat + '@' + config.muc,
+                type: 'groupchat',
+                id: config.nickname + new Date().getTime()
+              });
+
+              stanza.c('body').t(line);
+
+              queue.push(stanza);
+            } catch (e) {
+              console.error('[ERROR]', e);
+            }
+          } else {
+            line = line.substring(4);
+
+            // Future feature
+          }
+        }
+      }
+    });
+
+    core.stderr.on('data', data => {
+      console.error('[ERROR] ' + groupchat + ':', data.toString('utf8').replace(/[\n\r]/g, ''));
+    });
+
+    core.on('close', () => {
+      console.error('[ERROR] ' + groupchat + ': Core is dead');
+      process.exit();
     });
   });
 
   fs.readdir(config.data, (error, files) => {
+    if (error) {
+      console.error('[ERROR] Unable to read dir', config.data);
+      process.exit(1);
+    }
+
     Promise.all(files.map(file => {
       if (path.extname(file) !== '.log') {
         return;
       }
 
-      const groupchat = file.split('-')[0].toLowerCase();
+      const groupchat = file.split('@')[0].toLowerCase();
 
       return new Promise(resolve => {
         fs.readFile(config.data + '/' + file, { encoding: 'utf-8' }, (error, content) => {
           if (error) {
-            console.error('Unable to read log file', file, error);
+            console.error('[ERROR] Unable to read log file', file, error);
+            resolve();
+            return;
           }
 
           content.split('\n').forEach(line => {
@@ -68,23 +125,18 @@ xmpp.on('online', data => {
             cores[groupchat].stdin.write(line + '\n');
           });
 
-          console.log('Log file digest:', file);
+          resolve();
         });
       });
     }))
 
     .then(() => {
       config.groupchats.forEach(groupchat => {
-        cores[groupchat].stdin.write('### CLEAN');
-        cores[groupchat].stdin.write('### ENABLE');
+        cores[groupchat].stdin.write('### ENABLE\n');
         xmpp.join(groupchat + '@' + config.muc + '/' + config.nickname);
       });
     });
   });
-});
-
-xmpp.on('error', error => {
-  console.error('XMPP Error', error);
 });
 
 xmpp.on('groupchat', (conference, from, message, stamp, delay) => {
@@ -97,8 +149,19 @@ xmpp.on('groupchat', (conference, from, message, stamp, delay) => {
   let now = moment();
   fs.appendFileSync(config.data + '/' + conference.toLowerCase() + '-' + now.format('YYYY-MM-DD') + '.log', '(' + now.format('HH:mm:ss') + ') ' + from + ' : ' + message + '\n');
 
-  cores[conference.split('@')[0].toLowerCase()].stdin.write(message + '\n');
+  cores[conference.split('@')[0].toLowerCase()].stdin.write(from + ' ' + message + '\n');
 });
+
+xmpp.on('error', error => {
+  console.error('[ERROR] XMPP Error', error);
+});
+
+xmpp.on('close', data => {
+  console.error('[ERROR] Connection closed:', data);
+  process.exit(1);
+});
+
+console.log('[INFO] Connecting to', config.host + ':' + config.port);
 
 xmpp.connect({
   jid: config.jid,
@@ -106,3 +169,16 @@ xmpp.connect({
   host: config.host,
   port: config.port
 });
+
+queueTimer = setInterval(function() {
+  if (queue.length) {
+      xmpp.conn.send(queue[0]);
+      queue.shift();
+  }
+}, 5000);
+
+process.on('exit', kill);
+process.on('SIGINT', kill);
+process.on('SIGUSR1', kill);
+process.on('SIGUSR2', kill);
+process.on('uncaughtException', kill);
