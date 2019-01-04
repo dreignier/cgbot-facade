@@ -19,12 +19,19 @@ const xmpp = require('simple-xmpp'),
 
 let cores = {},
     queueTimer,
-    queue = [];
+    queue = [],
+    killed = false;
 
 // *****************************
 // Functions
 
 let kill = () => {
+  if (killed) {
+    return;
+  }
+
+  killed = true;
+
   console.log('[INFO] Closing process');
 
   clearInterval(queueTimer);
@@ -35,6 +42,7 @@ let kill = () => {
       cores[groupchat] = undefined;
     }
   });
+
   process.exit();
 };
 
@@ -44,54 +52,64 @@ let kill = () => {
 config.groupchats = config.groupchats.map(groupchat => groupchat.toLowerCase());
 
 xmpp.on('online', data => {
-  console.log('[INFO] Online');
+  console.log('[INFO] Online:', data);
 
   const command = config.core.split(' ');
   config.groupchats.forEach(groupchat => {
-    const core = spawn(command[0], _.rest(command));
+    try {
+      const core = spawn(command[0], _.rest(command), { stdio : ['pipe', 'pipe', 'pipe', 'ipc'] });
 
-    cores[groupchat] = core;
+      cores[groupchat] = core;
 
-    core.stdout.on('data', data => {
-      data = data.toString('utf8').split('\n');
+      core.stdout.on('data', data => {
+        data = data.toString('utf8').split('\n');
 
-      for (let line of data) {
-        line = line.replace(/[\n\r]/g, '');
+        for (let line of data) {
+          line = line.replace(/[\n\r]/g, '');
 
-        if (line) {
-          console.log('[INFO]', groupchat + ':', line);
+          if (line) {
+            console.log('[INFO]', groupchat + ':', line);
 
-          if (!line.startsWith('###')) {
-            try {
-              let stanza = new Stanza('message', {
-                to: groupchat + '@' + config.muc,
-                type: 'groupchat',
-                id: config.nickname + new Date().getTime()
-              });
+            if (!line.startsWith('###')) {
+              try {
+                let stanza = new Stanza('message', {
+                  to: groupchat + '@' + config.muc,
+                  type: 'groupchat',
+                  id: config.nickname + new Date().getTime()
+                });
 
-              stanza.c('body').t(line);
+                stanza.c('body').t(line);
 
-              queue.push(stanza);
-            } catch (e) {
-              console.error('[ERROR]', e);
+                queue.push(stanza);
+              } catch (e) {
+                console.error('[ERROR]', e);
+              }
+            } else {
+              line = line.substring(4);
+
+              // Future feature
             }
-          } else {
-            line = line.substring(4);
-
-            // Future feature
           }
         }
-      }
-    });
+      });
 
-    core.stderr.on('data', data => {
-      console.error('[ERROR] ' + groupchat + ':', data.toString('utf8').replace(/[\n\r]/g, ''));
-    });
+      core.stderr.on('data', data => {
+        data = data.toString('utf8').split('\n');
 
-    core.on('close', () => {
-      console.error('[ERROR] ' + groupchat + ': Core is dead');
-      process.exit();
-    });
+        for (let line of data) {
+          line = line.replace(/[\n\r]/g, '');
+          console.error('[ERROR]', groupchat + ':', line);
+        }
+      });
+
+      core.on('close', () => {
+        console.error('[ERROR]', groupchat + ': Core is dead');
+        process.exit(1);
+      });
+    } catch (e) {
+      console.error("[ERROR] Can't spawn", groupchat + ':', e);
+      process.exit(1);
+    }
   });
 
   fs.readdir(config.data, (error, files) => {
@@ -100,42 +118,60 @@ xmpp.on('online', data => {
       process.exit(1);
     }
 
-    Promise.all(files.map(file => {
-      if (path.extname(file) !== '.log') {
-        return;
-      }
+    try {
+      Promise.all(config.groupchats.map(groupchat => {
+          return files.reduce((promise, file) => {
+            try {
+              if (path.extname(file) !== '.log') {
+                return promise;
+              }
 
-      const groupchat = file.split('@')[0].toLowerCase();
+              const fileGroupchat = file.split('@')[0].toLowerCase();
 
-      return new Promise(resolve => {
-        fs.readFile(config.data + '/' + file, { encoding: 'utf-8' }, (error, content) => {
-          if (error) {
-            console.error('[ERROR] Unable to read log file', file, error);
-            resolve();
-            return;
-          }
+              if (fileGroupchat !== groupchat) {
+                return promise;
+              }
 
-          content.split('\n').forEach(line => {
-            if (!line || line[0] !== '(' || line[9] !== ')') {
-              return;
+              return promise.then(() => {
+                return new Promise((resolve, reject) => {
+
+                  try {
+                    let stream = fs.createReadStream(config.data + '/' + file, { encoding: 'utf-8' });
+
+                    stream.on('end', () => {
+                      stream.close();
+                      resolve();
+                    });
+
+                    stream.pipe(cores[groupchat].stdin, {
+                      end: false
+                    });
+                  } catch (e) {
+                    reject(e);
+                  }
+                });
+              });
+            } catch (e) {
+              console.error('[ERROR] Unable to log file', file + ':', e);
             }
+          }, Promise.resolve());
+      }))
 
-            line = line.substring(11).replace(' : ', '');
-
-            cores[groupchat].stdin.write(line + '\n');
-          });
-
-          resolve();
+      .then(() => {
+        config.groupchats.forEach(groupchat => {
+          cores[groupchat].stdin.write('### ENABLE\n');
+          xmpp.join(groupchat + '@' + config.muc + '/' + config.nickname);
         });
-      });
-    }))
+      })
 
-    .then(() => {
-      config.groupchats.forEach(groupchat => {
-        cores[groupchat].stdin.write('### ENABLE\n');
-        xmpp.join(groupchat + '@' + config.muc + '/' + config.nickname);
+      .catch(error => {
+        console.error('[ERROR] Unable to read logs files: ', error);
+        process.exit(1);
       });
-    });
+    } catch (error) {
+      console.error('[ERROR] Unable to read logs files: ', error);
+      process.exit(1);
+    }
   });
 });
 
