@@ -25,7 +25,7 @@ let cores = {},
 // *****************************
 // Functions
 
-let kill = () => {
+let kill = (code) => {
   if (killed) {
     return;
   }
@@ -37,13 +37,13 @@ let kill = () => {
   clearInterval(queueTimer);
 
   config.groupchats.forEach(groupchat => {
-    if (cores.groupchat) {
+    if (cores[groupchat]) {
       cores[groupchat].kill();
       cores[groupchat] = undefined;
     }
   });
 
-  setTimeout(() => process.exit, 5000);
+  setTimeout(() => process.exit(code), 5000);
 };
 
 // *****************************
@@ -104,18 +104,18 @@ xmpp.on('online', data => {
 
       core.on('close', () => {
         console.error('[ERROR]', groupchat + ': Core is dead');
-        process.exit(1);
+        kill(1);
       });
     } catch (e) {
       console.error("[ERROR] Can't spawn", groupchat + ':', e);
-      process.exit(1);
+      kill(1);
     }
   });
 
   fs.readdir(config.data, (error, files) => {
     if (error) {
       console.error('[ERROR] Unable to read dir', config.data);
-      process.exit(1);
+      kill(1);
     }
 
     try {
@@ -166,11 +166,11 @@ xmpp.on('online', data => {
 
       .catch(error => {
         console.error('[ERROR] Unable to read logs files: ', error);
-        process.exit(1);
+        kill(1);
       });
     } catch (error) {
       console.error('[ERROR] Unable to read logs files: ', error);
-      process.exit(1);
+      kill(1);
     }
   });
 });
@@ -194,7 +194,7 @@ xmpp.on('error', error => {
 
 xmpp.on('close', data => {
   console.error('[ERROR] Connection closed:', data);
-  process.exit(1);
+  kill(1);
 });
 
 console.log('[INFO] Connecting to', config.host + ':' + config.port);
