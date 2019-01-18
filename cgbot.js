@@ -43,7 +43,7 @@ let kill = () => {
     }
   });
 
-  process.exit();
+  setTimeout(() => process.exit, 5000);
 };
 
 // *****************************
